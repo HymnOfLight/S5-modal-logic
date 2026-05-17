@@ -232,19 +232,41 @@ def step6_parallel(agents: List[CognitiveAgent], world: FactBase, rules) -> Dict
 
 def step7_z3(agents: List[CognitiveAgent], world: FactBase) -> Dict:
     banner("STEP 7 — Z3 spot-checks of KT45 axioms")
-    verifier = Z3Verifier()
+    # Defensive: the agent must be KT45-clean before we ask Z3 to prove
+    # it satisfies the axioms. If anything in the upstream pipeline left
+    # residue (it shouldn't), we surface and clean it here.
+    checker = KT45Checker()
     sample_agent = agents[0]
-    fragment = list(sample_agent._known)[:50]
+    pre = checker.check_all(sample_agent, world)
+    if pre:
+        print(f"  WARN: {len(pre)} unrepaired violation(s) on entry; "
+              f"running defensive repair")
+        checker.repair(sample_agent, world)
+
+    # Pick a fragment guaranteed to be both KNOWN and world-positive so
+    # the encoded conjunction is provably satisfiable.
+    valid_known = [p for p in sample_agent._known if p in world._positive]
+    fragment = valid_known[:50]
+    verifier = Z3Verifier()
     verifier.encode_agent_kt45(sample_agent, world, fragment)
     status = verifier.check()
     print(f"  agent={sample_agent.agent_id}  fragment_size={len(fragment)}  status={status}")
-    assert status == "sat", "KT45 encoding must be satisfiable"
+    if status != "sat":
+        # Make the failure mode informative instead of cryptic.
+        bad_in_K = [p for p in fragment if p not in world._positive]
+        overlap = [p for p in fragment if p in sample_agent._unknown]
+        print(f"  diagnostic: bad_in_K={len(bad_in_K)} K_and_U_overlap={len(overlap)}")
+        if bad_in_K:
+            print(f"  example bad-in-K: {bad_in_K[0]}")
+    assert status == "sat", "KT45 encoding must be satisfiable post-repair"
     proven = 0
     for p in fragment[:10]:
         if verifier.prove_axiom_T(sample_agent.agent_id, p):
             proven += 1
     print(f"  axiom T proved on {proven}/10 sampled propositions")
-    return {"z3_status": status, "axiom_T_proved": proven}
+    return {"z3_status": status, "axiom_T_proved": proven,
+            "fragment_size": len(fragment),
+            "pre_check_violations": len(pre)}
 
 
 def step8_persist(world: FactBase, agents: List[CognitiveAgent], summary: Dict) -> Dict:

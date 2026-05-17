@@ -101,11 +101,18 @@ class ParallelEngine:
 
     def repair_population(self, agents: List[CognitiveAgent],
                           world: FactBase) -> Tuple[List[CognitiveAgent], int, float]:
-        """Run KT45 repair on every agent across ``workers`` processes."""
+        """Run KT45 repair on every agent across ``workers`` processes.
+
+        The original ``agents`` objects are mutated **in place** with the
+        repaired state. The returned list is the same list that was
+        passed in — this keeps caller-side references stable and avoids
+        a class of bugs where post-parallel updates are silently lost
+        because the caller forgot to reassign.
+        """
         if not agents:
             return agents, 0, 0.0
         start = time.perf_counter()
-        # Single-process fast path keeps the demo snappy on tiny cohorts.
+        # Single-process fast path keeps small cohorts snappy.
         if self.workers == 1 or len(agents) <= 4:
             checker = KT45Checker()
             total = 0
@@ -121,20 +128,23 @@ class ParallelEngine:
                 _repair_worker,
                 [(c, world_state) for c in chunks],
             ))
-        out: List[CognitiveAgent] = []
         repaired_total = 0
+        # Index originals by id, then write worker output back into them.
+        by_id = {a.agent_id: a for a in agents}
         for new_states, n in results:
             repaired_total += n
             for st in new_states:
-                out.append(CognitiveAgent.from_state(st))
-        # Preserve original ordering by id.
-        order = {a.agent_id: i for i, a in enumerate(agents)}
-        out.sort(key=lambda a: order.get(a.agent_id, 0))
-        return out, repaired_total, time.perf_counter() - start
+                target = by_id.get(st["agent_id"])
+                if target is not None:
+                    self._copy_state_into(target, st)
+                else:  # defensive: fall back to a fresh agent
+                    agents.append(CognitiveAgent.from_state(st))
+        return agents, repaired_total, time.perf_counter() - start
 
     def infer_population(self, agents: List[CognitiveAgent],
                          world: FactBase,
                          rules: Sequence[Rule]) -> Tuple[List[CognitiveAgent], int, float]:
+        """Run forward-chaining saturation in parallel; mutates in place."""
         if not agents:
             return agents, 0, 0.0
         start = time.perf_counter()
@@ -154,15 +164,28 @@ class ParallelEngine:
                 _infer_worker,
                 [(c, world_state, rules_payload) for c in chunks],
             ))
-        out: List[CognitiveAgent] = []
         derived_total = 0
+        by_id = {a.agent_id: a for a in agents}
         for new_states, n in results:
             derived_total += n
             for st in new_states:
-                out.append(CognitiveAgent.from_state(st))
-        order = {a.agent_id: i for i, a in enumerate(agents)}
-        out.sort(key=lambda a: order.get(a.agent_id, 0))
-        return out, derived_total, time.perf_counter() - start
+                target = by_id.get(st["agent_id"])
+                if target is not None:
+                    self._copy_state_into(target, st)
+                else:
+                    agents.append(CognitiveAgent.from_state(st))
+        return agents, derived_total, time.perf_counter() - start
+
+    @staticmethod
+    def _copy_state_into(target: CognitiveAgent, state: Dict) -> None:
+        """Replace ``target``'s mutable fields with those from ``state``."""
+        fresh = CognitiveAgent.from_state(state)
+        target._known = fresh._known
+        target._unknown = fresh._unknown
+        target._inferred = fresh._inferred
+        target._meta_knows_known = fresh._meta_knows_known
+        target._meta_knows_unknown = fresh._meta_knows_unknown
+        target.metadata = fresh.metadata
 
     @staticmethod
     def _chunk(items: List, n: int) -> List[List]:
